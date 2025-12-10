@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PS2 Crystal Clock (dutch comments)</title>
+    <style>
+        body { 
+            margin: 0; 
+            overflow: hidden; 
+            background-color: #000;
+            background: radial-gradient(circle at center, #0f081a 0%, #04000d 70%, #000000 100%);
+        }
+        canvas { display: block; }
+
+        .scanlines {
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: linear-gradient(
+                to bottom,
+                rgba(255,255,255,0),
+                rgba(255,255,255,0) 50%,
+                rgba(0,0,0,0.12) 50%,
+                rgba(0,0,0,0.12)
+            );
+            background-size: 100% 4px;
+            pointer-events: none;
+            z-index: 10;
+            opacity: 0.8;
+        }
+        .vignette {
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: radial-gradient(circle, transparent 45%, black 150%);
+            pointer-events: none;
+            z-index: 11;
+        }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+</head>
+<body>
+    <div class="scanlines"></div>
+    <div class="vignette"></div>
+
+    <script>
+        // --- CONFIGURATIE ---
+        const CONFIG = {
+            columnCount: 12,
+            orbCount: 7,
+            trailLength: 35,
+            colorBg: 0x050011,
+            colorCrystalBase: 0x44ccff, 
+            colorHighlight: 0xffffff, 
+            radius: 130,
+            crystalLength: 90,
+            crystalWidth: 15,
+            rotationSpeedX: 0.0005, 
+            rotationSpeedY: 0.0004,
+            rotationSpeedZ: -0.0015,
+            colorCycleDuration: 10.0, 
+            colorPalette: [
+                new THREE.Color(0x44ccff),
+                new THREE.Color(0x224488),
+                new THREE.Color(0x9966cc)
+            ]
+        };
+
+        // --- VARIABELEN ---
+        let colorCycleStartTime = 0;
+        let currentColorIndex = 0;
+        let nextColorIndex = 1;
+        const currentColor = CONFIG.colorPalette[0].clone(); 
+        const targetColor = CONFIG.colorPalette[1].clone(); 
+
+        // --- SCENE SETUP ---
+        const scene = new THREE.Scene();
+        scene.fog = new THREE.FogExp2(currentColor, 0.002);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 1, 1000);
+        camera.position.set(0, 0, 360); 
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.physicallyCorrectLights = true;
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.outputEncoding = THREE.sRGBEncoding;
+        document.body.appendChild(renderer.domElement);
+
+        // --- LIGHTING ---
+        const ambientLight = new THREE.AmbientLight(0x222244, 2.5);
+        scene.add(ambientLight);
+
+        const centerLight = new THREE.PointLight(currentColor, 250, 450);
+        centerLight.position.set(0, 0, 0);
+        scene.add(centerLight);
+
+        const activeLight = new THREE.PointLight(CONFIG.colorHighlight, 350, 250);
+        scene.add(activeLight);
+
+        const clockGroup = new THREE.Group();
+        scene.add(clockGroup);
+        
+        clockGroup.rotation.x = -Math.PI / 3.2; 
+        clockGroup.rotation.z = -Math.PI / 6;
+
+        // --- MATERIALEN ---
+        const baseCrystalMat = new THREE.MeshPhysicalMaterial({
+            color: currentColor,
+            metalness: 0.3, roughness: 0.05, transmission: 0.7, thickness: 15,
+            envMapIntensity: 1.6, clearcoat: 1.0, clearcoatRoughness: 0.05,
+            transparent: true, opacity: 0.85, side: THREE.DoubleSide
+        });
+
+        const edgeMat = new THREE.LineBasicMaterial({
+            color: 0x88ddff, transparent: true, opacity: 0.4, blending: THREE.AdditiveBlending
+        });
+
+        const activeCrystalMat = new THREE.MeshPhysicalMaterial({
+            color: CONFIG.colorHighlight, emissive: 0xaaaaff, emissiveIntensity: 8.0,
+            metalness: 0.1, roughness: 0.0, transmission: 0.2,
+            transparent: true, opacity: 1.0
+        });
+
+        const activeEdgeMat = new THREE.LineBasicMaterial({
+            color: CONFIG.colorHighlight, opacity: 1.0, blending: THREE.AdditiveBlending
+        });
+
+        // --- GEOMETRIE ---
+        const geometry = new THREE.CylinderGeometry(
+            CONFIG.crystalWidth / 2, CONFIG.crystalWidth / 2, CONFIG.crystalLength, 6
+        );
+        geometry.rotateX(Math.PI / 2); 
+        const edgesGeometry = new THREE.EdgesGeometry(geometry);
+
+        const crystals = [];
+
+        for (let i = 0; i < CONFIG.columnCount; i++) {
+            const wrapper = new THREE.Group();
+            const mesh = new THREE.Mesh(geometry, baseCrystalMat);
+            const edges = new THREE.LineSegments(edgesGeometry, edgeMat);
+            edges.scale.set(1.02, 1.02, 1.02);
+            wrapper.add(mesh);
+            wrapper.add(edges);
+
+            const angle = (i / CONFIG.columnCount) * Math.PI * 2;
+            wrapper.position.x = Math.cos(angle) * CONFIG.radius;
+            wrapper.position.y = Math.sin(angle) * CONFIG.radius;
+            wrapper.position.z = 0;
+            wrapper.lookAt(0, 0, 0);
+
+            clockGroup.add(wrapper);
+            crystals.push({ mesh, edges, wrapper });
+        }
+
+        // --- ORBS & TRAILS SYSTEM ---
+        const trails = [];
+        
+        // AANGEPAST: Texture met fellere kern voor meer glow
+        const getGlowTexture = () => {
+            const c = document.createElement('canvas');
+            c.width=64; c.height=64;
+            const ctx = c.getContext('2d');
+            const g = ctx.createRadialGradient(32,32,0,32,32,32);
+            // Feller wit in het midden, bredere heldere kern
+            g.addColorStop(0, 'rgba(255,255,255,1)');
+            g.addColorStop(0.3, 'rgba(200,235,255,0.9)'); 
+            g.addColorStop(0.6, 'rgba(80,120,255,0.5)');
+            g.addColorStop(1, 'rgba(0,0,0,0)');
+            ctx.fillStyle = g;
+            ctx.fillRect(0,0,64,64);
+            return new THREE.CanvasTexture(c);
+        };
+        const spriteMat = new THREE.SpriteMaterial({ 
+            map: getGlowTexture(), 
+            color: 0xffffff, 
+            blending: THREE.AdditiveBlending,
+            transparent: true, 
+            opacity: 1.0
+        });
+        
+        for(let i=0; i<CONFIG.orbCount; i++) {
+            const orbData = { snakeIndex: i, history: [] };
+            const sprite = new THREE.Sprite(spriteMat);
+            // Basis schaal iets groter
+            sprite.scale.set(18, 18, 1);
+            clockGroup.add(sprite);
+            orbData.sprite = sprite;
+
+            const trailGeo = new THREE.BufferGeometry();
+            const positions = new Float32Array(CONFIG.trailLength * 3);
+            trailGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            
+            // AANGEPAST: Trail materiaal feller en minder doorzichtig
+            const trailMat = new THREE.LineBasicMaterial({
+                color: 0x66aaff, // Iets helderder blauw
+                transparent: true,
+                opacity: 0.75, // Was 0.5, nu veel zichtbaarder
+                blending: THREE.AdditiveBlending
+            });
+            const trailLine = new THREE.Line(trailGeo, trailMat);
+            clockGroup.add(trailLine);
+            orbData.trailLine = trailLine;
+            orbData.trailPositions = positions;
+            trails.push(orbData);
+        }
+
+        // --- PHYSICS VARIABELEN ---
+        let snakeSpeed = 1.0;
+        let targetSpeed = 1.0;
+        let velocityTime = 0;
+
+        // --- LOOP ---
+        function updateTime() {
+            const activeIndex = Math.floor(Date.now() / 1000) % 12;
+            crystals.forEach((c, idx) => {
+                if (idx === activeIndex) {
+                    c.mesh.material = activeCrystalMat;
+                    c.edges.material = activeEdgeMat;
+                    c.wrapper.position.z = 0; 
+                    const pos = new THREE.Vector3();
+                    c.wrapper.getWorldPosition(pos);
+                    activeLight.position.copy(pos);
+                    activeLight.position.z += 25;
+                } else {
+                    c.mesh.material = baseCrystalMat;
+                    c.edges.material = edgeMat;
+                    c.wrapper.position.z = 0;
+                }
+            });
+        }
+
+        function animate(time) {
+            requestAnimationFrame(animate);
+            const t = time * 0.001; 
+
+            // --- KLEUR OVERGANG ---
+            if (colorCycleStartTime === 0) colorCycleStartTime = t;
+            const elapsed = t - colorCycleStartTime;
+            let progress = elapsed / CONFIG.colorCycleDuration;
+            if (progress >= 1.0) {
+                progress = 0; colorCycleStartTime = t;
+                currentColorIndex = nextColorIndex;
+                let newIndex = currentColorIndex;
+                while (newIndex === currentColorIndex) newIndex = Math.floor(Math.random() * CONFIG.colorPalette.length);
+                nextColorIndex = newIndex;
+                currentColor.copy(CONFIG.colorPalette[currentColorIndex]);
+                targetColor.copy(CONFIG.colorPalette[nextColorIndex]);
+            }
+            baseCrystalMat.color.lerpColors(currentColor, targetColor, progress);
+            centerLight.color.copy(baseCrystalMat.color);
+            scene.fog.color.copy(baseCrystalMat.color).multiplyScalar(0.3);
+
+            // --- ROTATIE ---
+            const qX = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), CONFIG.rotationSpeedX * Math.sin(t * 0.4));
+            const qY = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), CONFIG.rotationSpeedY * Math.cos(t * 0.3));
+            const qZ = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), CONFIG.rotationSpeedZ);
+            clockGroup.quaternion.multiply(qX).multiply(qY).multiply(qZ);
+
+            // --- AANGEPAST: ACCELERATIE LOGICA (Veel soepeler) ---
+            if (Math.random() < 0.02) { 
+                const isFast = Math.random() > 0.6;
+                // Topsnelheid verlaagd met ~60% (Max was ~6.0, nu ~2.5)
+                targetSpeed = isFast ? (1.5 + Math.random() * 1.0) : (0.3 + Math.random() * 0.5);
+            }
+            // Lerp factor drastisch verlaagd voor hele trage transitie (0.03 -> 0.005)
+            snakeSpeed += (targetSpeed - snakeSpeed) * 0.005;
+            velocityTime += snakeSpeed * 0.015;
+
+            // --- ORB POSITIES ---
+            trails.forEach(orb => {
+                let spacing = 0.12 + (snakeSpeed * 0.02); 
+                spacing = Math.min(spacing, 0.4);
+                const myTime = velocityTime - (orb.snakeIndex * spacing);
+                const rBase = 60; const rVar = Math.sin(myTime * 3.0) * 15; const radius = rBase + rVar;
+                const x = Math.cos(myTime) * radius;
+                const y = Math.sin(myTime) * radius;
+                const z = Math.sin(myTime * 2.5) * 30 + Math.cos(myTime * 1.0) * 15;
+                orb.sprite.position.set(x, y, z);
+                
+                // AANGEPAST: Grotere schaal voor meer glow effect
+                const scale = 20 + (snakeSpeed * 2.0);
+                orb.sprite.scale.set(scale, scale, 1);
+
+                // --- TRAIL UPDATE ---
+                const hist = orb.history; hist.unshift({x, y, z}); if(hist.length > CONFIG.trailLength) hist.pop();
+                const positions = orb.trailPositions;
+                for(let k=0; k < CONFIG.trailLength; k++) {
+                    const pt = hist[k] || hist[hist.length-1] || {x,y,z};
+                    positions[k*3] = pt.x; positions[k*3+1] = pt.y; positions[k*3+2] = pt.z;
+                }
+                orb.trailLine.geometry.attributes.position.needsUpdate = true;
+            });
+
+            updateTime();
+            renderer.render(scene, camera);
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        animate(0);
+
+    </script>
+</body>
+</html>
