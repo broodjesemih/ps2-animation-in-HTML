@@ -3,13 +3,17 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PS2 Crystal Clock (dutch comments)</title>
+    <title>PS2 Crystal Clock - Interactive</title>
     <style>
         body { 
             margin: 0; 
             overflow: hidden; 
             background-color: #000;
             background: radial-gradient(circle at center, #0f081a 0%, #04000d 70%, #000000 100%);
+            cursor: grab; /* Laat zien dat je kan pakken */
+        }
+        body:active {
+            cursor: grabbing;
         }
         canvas { display: block; }
 
@@ -37,6 +41,7 @@
         }
     </style>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
 </head>
 <body>
     <div class="scanlines"></div>
@@ -87,6 +92,15 @@
         renderer.outputEncoding = THREE.sRGBEncoding;
         document.body.appendChild(renderer.domElement);
 
+        // --- CONTROLS (Interactie) ---
+        // Dit zorgt ervoor dat je kan draaien met de muis
+        const controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true; // Zorgt voor de 'smooth' uitloop als je loslaat
+        controls.dampingFactor = 0.05;
+        controls.enablePan = false; // We willen niet dat de klok uit beeld schuift
+        controls.minDistance = 200; // Niet te ver inzoomen
+        controls.maxDistance = 600; // Niet te ver uitzoomen
+
         // --- LIGHTING ---
         const ambientLight = new THREE.AmbientLight(0x222244, 2.5);
         scene.add(ambientLight);
@@ -101,6 +115,7 @@
         const clockGroup = new THREE.Group();
         scene.add(clockGroup);
         
+        // Start oriëntatie
         clockGroup.rotation.x = -Math.PI / 3.2; 
         clockGroup.rotation.z = -Math.PI / 6;
 
@@ -156,13 +171,11 @@
         // --- ORBS & TRAILS SYSTEM ---
         const trails = [];
         
-        // AANGEPAST: Texture met fellere kern voor meer glow
         const getGlowTexture = () => {
             const c = document.createElement('canvas');
             c.width=64; c.height=64;
             const ctx = c.getContext('2d');
             const g = ctx.createRadialGradient(32,32,0,32,32,32);
-            // Feller wit in het midden, bredere heldere kern
             g.addColorStop(0, 'rgba(255,255,255,1)');
             g.addColorStop(0.3, 'rgba(200,235,255,0.9)'); 
             g.addColorStop(0.6, 'rgba(80,120,255,0.5)');
@@ -182,7 +195,6 @@
         for(let i=0; i<CONFIG.orbCount; i++) {
             const orbData = { snakeIndex: i, history: [] };
             const sprite = new THREE.Sprite(spriteMat);
-            // Basis schaal iets groter
             sprite.scale.set(18, 18, 1);
             clockGroup.add(sprite);
             orbData.sprite = sprite;
@@ -191,11 +203,10 @@
             const positions = new Float32Array(CONFIG.trailLength * 3);
             trailGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
             
-            // AANGEPAST: Trail materiaal feller en minder doorzichtig
             const trailMat = new THREE.LineBasicMaterial({
-                color: 0x66aaff, // Iets helderder blauw
+                color: 0x66aaff,
                 transparent: true,
-                opacity: 0.75, // Was 0.5, nu veel zichtbaarder
+                opacity: 0.75,
                 blending: THREE.AdditiveBlending
             });
             const trailLine = new THREE.Line(trailGeo, trailMat);
@@ -234,6 +245,9 @@
             requestAnimationFrame(animate);
             const t = time * 0.001; 
 
+            // Update Controls (belangrijk voor de damping/inertie)
+            controls.update();
+
             // --- KLEUR OVERGANG ---
             if (colorCycleStartTime === 0) colorCycleStartTime = t;
             const elapsed = t - colorCycleStartTime;
@@ -251,23 +265,23 @@
             centerLight.color.copy(baseCrystalMat.color);
             scene.fog.color.copy(baseCrystalMat.color).multiplyScalar(0.3);
 
-            // --- ROTATIE ---
+            // --- ROTATIE (Automatisch tuimelen) ---
+            // Dit blijft draaien, maar omdat controls.update() ook draait, 
+            // werken ze samen. De controls draaien de camera, dit draait het object.
             const qX = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), CONFIG.rotationSpeedX * Math.sin(t * 0.4));
             const qY = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), CONFIG.rotationSpeedY * Math.cos(t * 0.3));
             const qZ = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), CONFIG.rotationSpeedZ);
             clockGroup.quaternion.multiply(qX).multiply(qY).multiply(qZ);
 
-            // --- AANGEPAST: ACCELERATIE LOGICA (Veel soepeler) ---
+            // --- ACCELERATIE ---
             if (Math.random() < 0.02) { 
                 const isFast = Math.random() > 0.6;
-                // Topsnelheid verlaagd met ~60% (Max was ~6.0, nu ~2.5)
                 targetSpeed = isFast ? (1.5 + Math.random() * 1.0) : (0.3 + Math.random() * 0.5);
             }
-            // Lerp factor drastisch verlaagd voor hele trage transitie (0.03 -> 0.005)
             snakeSpeed += (targetSpeed - snakeSpeed) * 0.005;
             velocityTime += snakeSpeed * 0.015;
 
-            // --- ORB POSITIES ---
+            // --- ORBS ---
             trails.forEach(orb => {
                 let spacing = 0.12 + (snakeSpeed * 0.02); 
                 spacing = Math.min(spacing, 0.4);
@@ -278,11 +292,9 @@
                 const z = Math.sin(myTime * 2.5) * 30 + Math.cos(myTime * 1.0) * 15;
                 orb.sprite.position.set(x, y, z);
                 
-                // AANGEPAST: Grotere schaal voor meer glow effect
                 const scale = 20 + (snakeSpeed * 2.0);
                 orb.sprite.scale.set(scale, scale, 1);
 
-                // --- TRAIL UPDATE ---
                 const hist = orb.history; hist.unshift({x, y, z}); if(hist.length > CONFIG.trailLength) hist.pop();
                 const positions = orb.trailPositions;
                 for(let k=0; k < CONFIG.trailLength; k++) {
