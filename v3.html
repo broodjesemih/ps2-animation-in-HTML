@@ -1,0 +1,599 @@
+<!DOCTYPE html>
+<html lang="nl">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PS2 Crystal Clock</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background: #000;
+            font-family: sans-serif;
+        }
+
+        canvas {
+            display: block;
+        }
+
+        .vignette {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: radial-gradient(circle, transparent 40%, rgba(0, 0, 0, 0.9) 130%);
+            pointer-events: none;
+            z-index: 11;
+        }
+    </style>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+        }
+    }
+    </script>
+</head>
+
+<body>
+    <div class="vignette"></div>
+    <script type="module">
+        import * as THREE from 'three';
+
+        // === CONFIG ===
+        const CONFIG = {
+            columnCount: 12,
+            radius: 130,
+            crystalLength: 110,
+            crystalWidth: 19,
+            spinSpeed: 0.0025,
+            crystalSelfRotationSpeed: 0.004,
+            colorCycleDuration: 10.0,
+        };
+
+
+        // === ORB CONSTANTEN ===
+        const ORBS = 7;
+        const TRAIL_FADE_TIME = 500;
+        const TRAIL_THICKNESS = 0.8;      // Dikte van de trail
+        const ORB_GLOW_SCALE = 55;        // Schaal van de outer glow
+        const ORB_RADIUS = 5;           // Straal van de inner orb (kern)
+        const MAX_SPHERE_RADIUS = 65;
+        const MIN_SPHERE_RADIUS = 60;
+        const X_SPEED = Math.PI / 2;
+        const Z_SPEED = -Math.PI;
+        const ANGLE_STEP = 6;
+        const ANGLES = [Math.PI / 2, Math.PI + Math.PI / 6, 0];
+
+        // === KLEUREN PARAMETERS ===
+        // Orb kleuren
+        const ORB_GLOW_COLOR = 0x3d83fc;      // Kleur van de outer glow
+        const ORB_CORE_COLOR = 0xccffff;      // Kleur van de inner orb kern
+        // Trail kleur
+        const TRAIL_COLOR = 0x3d83fc;         // Kleur van de trail
+
+        // Crystal kleuren (cyclet van A naar B naar C etc.)
+        const CRYSTAL_COLORS = [
+            new THREE.Color(0x530166),   // Licht blauw
+            new THREE.Color(0x017980),   // Violet/paars
+            new THREE.Color(0x530166),   // Terug naar licht blauw (smooth loop)
+        ];
+
+        // === GLOBALS ===
+        let currentColorIndex = 0, nextColorIndex = 1;
+        let colorCycleStartTime = 0;
+        const currentCrystalColor = CRYSTAL_COLORS[0].clone();
+        let currentRotationAxis = new THREE.Vector3(0, 1, 0);
+        let trailHistory = Array(ORBS).fill(null).map(() => []);
+        let orbPositions = Array(ORBS).fill(null).map(() => new THREE.Vector3());
+
+        // === SCENE ===
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x050510);
+
+        const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 1, 1000);
+        camera.position.set(0, 0, 360);
+        camera.lookAt(0, 0, 0);
+
+        // === AUTO-SCALE VOOR TELEFOONS ===
+        function updateCameraForScreen() {
+            const aspect = innerWidth / innerHeight;
+            // Op portrait schermen (aspect < 1), zoom uit om de hele klok te zien
+            // Basisafstand is 360, op smalle schermen tot 550
+            const baseDistance = 360;
+            const mobileDistance = 550;
+
+            if (aspect < 1) {
+                // Portrait mode - interpoleer tussen base en mobile op basis van aspect
+                const t = Math.max(0, Math.min(1, (1 - aspect) / 0.5));
+                camera.position.z = baseDistance + (mobileDistance - baseDistance) * t;
+            } else {
+                camera.position.z = baseDistance;
+            }
+        }
+        updateCameraForScreen();
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(innerWidth, innerHeight);
+        renderer.setPixelRatio(Math.min(devicePixelRatio, 2)); // Cap pixel ratio voor performance
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.0;
+        document.body.appendChild(renderer.domElement);
+
+        // === ENVIRONMENT MAP ===
+        const pmremGenerator = new THREE.PMREMGenerator(renderer);
+
+        const envCanvas = document.createElement('canvas');
+        envCanvas.width = 512; envCanvas.height = 256;
+        const envCtx = envCanvas.getContext('2d');
+
+        const grad = envCtx.createLinearGradient(0, 0, 0, 256);
+        grad.addColorStop(0, '#000510');
+        grad.addColorStop(0.3, '#0a1525');
+        grad.addColorStop(0.5, '#1a3550');
+        grad.addColorStop(0.7, '#0a1525');
+        grad.addColorStop(1, '#000510');
+        envCtx.fillStyle = grad;
+        envCtx.fillRect(0, 0, 512, 256);
+
+        envCtx.fillStyle = '#2a5580';
+        envCtx.fillRect(100, 100, 50, 56);
+        envCtx.fillRect(362, 100, 50, 56);
+
+        const envTexture = new THREE.CanvasTexture(envCanvas);
+        envTexture.mapping = THREE.EquirectangularReflectionMapping;
+        const envMap = pmremGenerator.fromEquirectangular(envTexture).texture;
+        scene.environment = envMap;
+
+        // === NOISE TEXTURE (SMOOTHER) ===
+        function createNoiseTexture() {
+            const c = document.createElement('canvas');
+            c.width = c.height = 256;
+            const ctx = c.getContext('2d');
+
+            // Create smoother noise by using larger blocks
+            const blockSize = 1; // Larger blocks = smoother
+            for (let y = 0; y < 256; y += blockSize) {
+                for (let x = 0; x < 256; x += blockSize) {
+                    const v = Math.floor(Math.random() * 80 + 100); // Less contrast
+                    ctx.fillStyle = `rgb(${v},${v},${v})`;
+                    ctx.fillRect(x, y, blockSize, blockSize);
+                }
+            }
+
+            const tex = new THREE.CanvasTexture(c);
+            tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+            tex.magFilter = THREE.LinearFilter; // Smooth filtering
+            tex.minFilter = THREE.LinearFilter;
+            return tex;
+        }
+
+        // === TUNNEL SHADERS ===
+        const tunnelVS = `
+            varying vec2 vUv;
+            varying vec3 vWorldPos, vNormal;
+            void main() {
+                vUv = uv;
+                vNormal = normalize(normalMatrix * normal);
+                vWorldPos = (modelMatrix * vec4(position, 1.0)).xyz;
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+            }
+        `;
+
+        const tunnelFS = `
+            uniform float time, opacity;
+            uniform sampler2D noise;
+            varying vec2 vUv;
+            varying vec3 vWorldPos, vNormal;
+
+            void main() {
+                vec3 c1 = vec3(0.27, 0.12, 0.4);
+                vec3 c2 = vec3(0.18, 0.10, 0.32);
+                float n = texture2D(noise, fract(vUv - vec2(0.0, time) - vec2(time, 0.0))).r;
+                
+                vec3 col = mix(c1 * 1.25, c2, smoothstep(0.0, 1.1, n));
+
+                vec3 L = normalize(cameraPosition - vWorldPos);
+                float d = abs(dot(normalize(vNormal), L));
+                col *= 0.2 + 0.8 * d;
+
+                float fade = 1.1 - smoothstep(0.0, 800.0, length(vWorldPos - cameraPosition));
+                gl_FragColor = vec4(col, fade * opacity);
+            }
+        `;
+
+        // === TUNNEL MESH ===
+        // Camera is at z=360, so tunnel needs to be bigger and positioned correctly
+        const tunnelGeometry = new THREE.CylinderGeometry(200, 200, 1000, 32, 1, true);
+        const tunnelMaterial = new THREE.ShaderMaterial({
+            uniforms: {
+                time: { value: 0 },
+                opacity: { value: 1 },
+                noise: { value: createNoiseTexture() }
+            },
+            vertexShader: tunnelVS,
+            fragmentShader: tunnelFS,
+            transparent: true,
+            side: THREE.BackSide,
+            depthWrite: false
+        });
+        const tunnelMesh = new THREE.Mesh(tunnelGeometry, tunnelMaterial);
+        tunnelMesh.rotation.x = Math.PI / 2;
+        tunnelMesh.position.z = 0; // Center it around the clock
+        scene.add(tunnelMesh);
+
+        // === LIGHTING ===
+        const ambientLight = new THREE.AmbientLight(0x101520, 0.5);
+        scene.add(ambientLight);
+
+        const mainLight = new THREE.DirectionalLight(0xaaccff, 3.0);
+        mainLight.position.set(100, 200, 300);
+        scene.add(mainLight);
+
+        const fillLight = new THREE.DirectionalLight(0x4466aa, 1.0);
+        fillLight.position.set(-150, -100, 200);
+        scene.add(fillLight);
+
+        const rimLight = new THREE.DirectionalLight(0x6688bb, 1.5);
+        rimLight.position.set(0, 0, -200);
+        scene.add(rimLight);
+
+        const centerLight = new THREE.PointLight(currentCrystalColor, 50, 400);
+        centerLight.position.set(0, 0, 0);
+        scene.add(centerLight);
+
+        const activeLight = new THREE.PointLight(0xffffff, 100, 200);
+        scene.add(activeLight);
+
+        // === CLOCKGROUP ===
+        const clockGroup = new THREE.Group();
+        scene.add(clockGroup);
+        clockGroup.rotation.x = -Math.PI / 6;
+
+        // === HEXAGONALE PRISM GEOMETRIE ===
+        function createPrismGeometry(length, width) {
+            const geo = new THREE.BufferGeometry();
+            const verts = [], norms = [], uvs = [];
+            const sides = 6, r = width / 2, topR = r * 0.75;
+            const halfLen = length / 2, taperStart = halfLen * 0.8;
+
+            const hex = (radius, z, i) => {
+                const a = i / sides * Math.PI * 2;
+                return new THREE.Vector3(Math.cos(a) * radius, Math.sin(a) * radius, z);
+            };
+
+            const addTri = (p1, p2, p3) => {
+                verts.push(p1.x, p1.y, p1.z, p2.x, p2.y, p2.z, p3.x, p3.y, p3.z);
+                const e1 = new THREE.Vector3().subVectors(p2, p1);
+                const e2 = new THREE.Vector3().subVectors(p3, p1);
+                const n = new THREE.Vector3().crossVectors(e1, e2).normalize();
+                norms.push(n.x, n.y, n.z, n.x, n.y, n.z, n.x, n.y, n.z);
+                uvs.push(0, 0, 1, 0, 0.5, 1);
+            };
+
+            for (let i = 0; i < sides; i++) {
+                addTri(new THREE.Vector3(0, 0, -halfLen), hex(r, -halfLen, (i + 1) % sides), hex(r, -halfLen, i));
+            }
+            for (let i = 0; i < sides; i++) {
+                const i2 = (i + 1) % sides;
+                addTri(hex(r, -halfLen, i), hex(r, -halfLen, i2), hex(r, taperStart, i));
+                addTri(hex(r, -halfLen, i2), hex(r, taperStart, i2), hex(r, taperStart, i));
+            }
+            for (let i = 0; i < sides; i++) {
+                const i2 = (i + 1) % sides;
+                addTri(hex(r, taperStart, i), hex(r, taperStart, i2), hex(topR, halfLen, i));
+                addTri(hex(r, taperStart, i2), hex(topR, halfLen, i2), hex(topR, halfLen, i));
+            }
+            for (let i = 0; i < sides; i++) {
+                addTri(new THREE.Vector3(0, 0, halfLen), hex(topR, halfLen, i), hex(topR, halfLen, (i + 1) % sides));
+            }
+
+            geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+            geo.setAttribute('normal', new THREE.Float32BufferAttribute(norms, 3));
+            geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+            geo.computeVertexNormals();
+            return geo;
+        }
+
+        // === CRYSTAL MATERIAAL - Echte glas look ===
+        function createCrystalMaterial() {
+            return new THREE.MeshPhysicalMaterial({
+                color: currentCrystalColor.clone(),
+
+                metalness: 0.0,
+                roughness: 0.0,
+
+                // Transmission voor doorschijnendheid - hoger = meer doorzichtig
+                transmission: 0.9,
+                thickness: 0.0,
+                ior: 1.0,
+
+                // Reflecties
+                envMapIntensity: 10.0,
+
+                // Clearcoat
+                clearcoat: 0.0,
+                clearcoatRoughness: 0.0,
+
+                // Emissive
+                emissive: currentCrystalColor.clone(),
+                emissiveIntensity: 0.0,
+
+                transparent: true,
+                side: THREE.DoubleSide,
+
+                envMap: envMap
+            });
+        }
+
+        // === KRISTALLEN ===
+        const prismGeo = createPrismGeometry(CONFIG.crystalLength, CONFIG.crystalWidth);
+        const crystals = [];
+
+        for (let i = 0; i < CONFIG.columnCount; i++) {
+            const wrapper = new THREE.Group();
+            const rotator = new THREE.Group();
+            wrapper.add(rotator);
+
+            const mesh = new THREE.Mesh(prismGeo, createCrystalMaterial());
+            rotator.add(mesh);
+
+            const angle = (Math.PI / 2) - ((i / CONFIG.columnCount) * Math.PI * 2);
+            const axis = new THREE.Vector3(Math.cos(angle), Math.sin(angle), 0).normalize();
+            wrapper.userData.axis = axis;
+            wrapper.position.x = Math.cos(angle) * CONFIG.radius;
+            wrapper.position.y = Math.sin(angle) * CONFIG.radius;
+            wrapper.position.z = 0;
+            wrapper.lookAt(0, 0, 0);
+
+            clockGroup.add(wrapper);
+            crystals.push({ mesh, wrapper, rotator });
+        }
+
+        // === ORB TEXTURE (voor glow) ===
+        function createOrbTexture() {
+            const c = document.createElement('canvas');
+            c.width = c.height = 128;
+            const ctx = c.getContext('2d');
+            const g = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
+            g.addColorStop(0, 'rgba(200, 240, 255, 1)');
+            g.addColorStop(0.15, 'rgba(150, 220, 255, 0.6)');
+            g.addColorStop(0.4, 'rgba(100, 180, 255, 0.2)');
+            g.addColorStop(0.7, 'rgba(50, 100, 200, 0.05)');
+            g.addColorStop(1, 'rgba(0, 0, 0, 0)');
+            ctx.fillStyle = g;
+            ctx.fillRect(0, 0, 128, 128);
+            return new THREE.CanvasTexture(c);
+        }
+
+        // === SOLID ORB TEXTURE (voor de kern/straal) ===
+        function createSolidOrbTexture() {
+            const c = document.createElement('canvas');
+            c.width = c.height = 128;
+            const ctx = c.getContext('2d');
+            const g = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
+            // Veel solidere kern - 70% is volledig wit, daarna snel fade
+            g.addColorStop(0, 'rgba(255, 255, 255, 1)');
+            g.addColorStop(0.5, 'rgba(220, 250, 255, 1)');
+            g.addColorStop(0.7, 'rgba(180, 230, 255, 0.9)');
+            g.addColorStop(0.85, 'rgba(100, 200, 255, 0.4)');
+            g.addColorStop(0.95, 'rgba(50, 150, 255, 0.1)');
+            g.addColorStop(1, 'rgba(0, 0, 0, 0)');
+            ctx.fillStyle = g;
+            ctx.fillRect(0, 0, 128, 128);
+            return new THREE.CanvasTexture(c);
+        }
+
+        const orbTexture = createOrbTexture();
+        const solidOrbTexture = createSolidOrbTexture();
+        const orbSprites = [];
+        const trailMeshes = [];
+
+        // === ORBS ===
+        for (let i = 0; i < ORBS; i++) {
+            const outerMat = new THREE.SpriteMaterial({
+                map: orbTexture,
+                color: ORB_GLOW_COLOR,
+                transparent: true,
+                blending: THREE.AdditiveBlending,
+                opacity: 0.3,
+                depthWrite: false
+            });
+            const outer = new THREE.Sprite(outerMat);
+            outer.scale.set(ORB_GLOW_SCALE * 1.5, ORB_GLOW_SCALE * 1.5, 1);
+            clockGroup.add(outer);
+
+            const innerMat = new THREE.SpriteMaterial({
+                map: solidOrbTexture,   // Solide texture voor de kern!
+                color: ORB_CORE_COLOR,
+                transparent: true,
+                blending: THREE.AdditiveBlending,
+                opacity: 0.8,           // Hogere opacity voor solidere look
+                depthWrite: false
+            });
+            const inner = new THREE.Sprite(innerMat);
+            inner.scale.set(ORB_RADIUS * 2, ORB_RADIUS * 2, 1);
+            clockGroup.add(inner);
+
+            orbSprites.push({ outer, inner });
+
+            const trailMat = new THREE.MeshBasicMaterial({
+                color: TRAIL_COLOR,
+                transparent: true,
+                blending: THREE.AdditiveBlending,
+                side: THREE.DoubleSide,
+                depthWrite: false,
+                opacity: 0.35
+            });
+            const trail = new THREE.Mesh(new THREE.BufferGeometry(), trailMat);
+            clockGroup.add(trail);
+            trailMeshes.push(trail);
+        }
+
+        // === HELPERS ===
+        const lerp = (a, b, t) => a + (b - a) * Math.max(0, Math.min(1, t));
+        const norm = (v, min, max) => max === min ? 0 : (v - min) / (max - min);
+
+        function getTimeInfo() {
+            const d = new Date();
+            return { hour: d.getHours(), minute: d.getMinutes(), second: d.getSeconds(), ms: d.getMilliseconds() };
+        }
+
+        function getElapsed(t) {
+            const min = t.second + t.ms / 1000;
+            const hr = t.minute * 60 + min;
+            const day = t.hour * 3600 + hr;
+            return { min, hr, day };
+        }
+
+        function getOrbAngle(time, i) {
+            return time * i * ANGLE_STEP * Math.PI / 180;
+        }
+
+        function lerpAngleX(elapsed, time) {
+            return lerp(ANGLES[time.minute % 3], ANGLES[(time.minute + 1) % 3], norm(elapsed.min, 0, 60));
+        }
+
+        function getRotMatrix(elapsed, time) {
+            const ax = X_SPEED * elapsed.min + lerpAngleX(elapsed, time);
+            const az = Z_SPEED * elapsed.min;
+            return new THREE.Matrix4()
+                .multiply(new THREE.Matrix4().makeRotationZ(az))
+                .multiply(new THREE.Matrix4().makeRotationX(ax));
+        }
+
+        function getOrbPos(secInMin, radius, idx, rotMat) {
+            const a = getOrbAngle(secInMin, idx);
+            return new THREE.Vector3(radius * Math.cos(a), radius * Math.sin(a), 0).applyMatrix4(rotMat);
+        }
+
+        // === TIJD UPDATE ===
+        function updateTime() {
+            const date = new Date();
+            const currentHour = date.getHours() % 12;
+            const currentMinute = Math.floor(date.getMinutes() / 5);
+            const currentSecond = Math.floor(date.getSeconds() / 5);
+
+            crystals.forEach((c, idx) => {
+                const mat = c.mesh.material;
+
+                mat.emissiveIntensity = 0.0;
+                mat.transmission = 0.85;
+
+                if (idx === currentHour) {
+                    mat.emissiveIntensity = 0.5;
+                    mat.transmission = 0.6;
+                    const worldPos = new THREE.Vector3();
+                    c.wrapper.getWorldPosition(worldPos);
+                    activeLight.position.copy(worldPos);
+                    activeLight.position.z += 30;
+                    currentRotationAxis.copy(c.wrapper.userData.axis);
+                } else if (idx === currentMinute) {
+                    mat.emissiveIntensity = 0.25;
+                    mat.transmission = 0.7;
+                } else if (idx === currentSecond) {
+                    mat.emissiveIntensity = 0.1;
+                    mat.transmission = 0.75;
+                }
+
+                mat.color.copy(currentCrystalColor);
+                mat.emissive.copy(currentCrystalColor);
+            });
+        }
+
+        // === TRAIL UPDATE ===
+        function updateTrails() {
+            const now = Date.now();
+            for (let i = 0; i < ORBS; i++) {
+                trailHistory[i].unshift({ p: orbPositions[i].clone(), t: now });
+                trailHistory[i] = trailHistory[i].filter(x => now - x.t < TRAIL_FADE_TIME).slice(0, 120);
+
+                if (trailHistory[i].length < 2) continue;
+
+                const verts = [];
+                for (let j = 0; j < trailHistory[i].length - 1; j++) {
+                    const p0 = trailHistory[i][j].p, p1 = trailHistory[i][j + 1].p;
+                    const alpha = lerp(1, 0, norm(now - trailHistory[i][j].t, 0, TRAIL_FADE_TIME));
+                    const w = TRAIL_THICKNESS * alpha;
+
+                    const dir = new THREE.Vector3().subVectors(p1, p0);
+                    if (dir.length() < 0.01) continue;
+                    dir.normalize();
+
+                    const toCamera = new THREE.Vector3(0, 0, 1);
+                    const side = new THREE.Vector3().crossVectors(toCamera, dir).normalize().multiplyScalar(w);
+
+                    const a = p0.clone().add(side), b = p0.clone().sub(side);
+                    const c = p1.clone().add(side), d = p1.clone().sub(side);
+                    verts.push(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z, c.x, c.y, c.z, b.x, b.y, b.z, d.x, d.y, d.z);
+                }
+
+                if (verts.length) {
+                    trailMeshes[i].geometry.dispose();
+                    trailMeshes[i].geometry = new THREE.BufferGeometry();
+                    trailMeshes[i].geometry.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+                }
+            }
+        }
+
+        // === ANIMATE ===
+        let lastTime = 0;
+        function animate(time) {
+            requestAnimationFrame(animate);
+            const t = time * 0.001;
+            lastTime = time;
+
+            // Kleur cyclus
+            if (colorCycleStartTime === 0) colorCycleStartTime = t;
+            let progress = (t - colorCycleStartTime) / CONFIG.colorCycleDuration;
+            if (progress >= 1) {
+                progress = 0;
+                colorCycleStartTime = t;
+                currentColorIndex = nextColorIndex;
+                nextColorIndex = (nextColorIndex + 1) % CRYSTAL_COLORS.length;
+            }
+            currentCrystalColor.lerpColors(CRYSTAL_COLORS[currentColorIndex], CRYSTAL_COLORS[nextColorIndex], progress);
+
+            centerLight.color.copy(currentCrystalColor);
+            activeLight.color.copy(currentCrystalColor);
+
+            // Rotaties
+            clockGroup.rotateOnWorldAxis(currentRotationAxis, CONFIG.spinSpeed);
+            crystals.forEach(c => c.rotator.rotation.z += CONFIG.crystalSelfRotationSpeed);
+
+            // Orb beweging
+            const timeInfo = getTimeInfo();
+            const elapsed = getElapsed(timeInfo);
+            const sphereRadius = lerp(MIN_SPHERE_RADIUS, MAX_SPHERE_RADIUS, norm(elapsed.hr, 0, 3600));
+            const rotMat = getRotMatrix(elapsed, timeInfo);
+
+            for (let i = 0; i < ORBS; i++) {
+                const pos = getOrbPos(elapsed.min, sphereRadius, i, rotMat);
+                orbPositions[i].copy(pos);
+                orbSprites[i].outer.position.copy(pos);
+                orbSprites[i].inner.position.copy(pos);
+            }
+
+            updateTrails();
+            updateTime();
+
+            // Update tunnel animation
+            tunnelMaterial.uniforms.time.value = (t * 0.0085) % 1;
+
+            renderer.render(scene, camera);
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = innerWidth / innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(innerWidth, innerHeight);
+            updateCameraForScreen();
+        });
+
+        animate(0);
+    </script>
+</body>
+
+</html>
